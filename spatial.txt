@@ -1,0 +1,198 @@
+Spatial
+
+What does it do
+
+The spatial functionalities of Hibernate enable indexed entities with latitude and longitude 
+fields to be spatialy indexed then searched and filtered by defining a search discus, 
+providing a center and a radius.
+
+
+How to use it
+
+To spatially index your entities, you shall either  :
+
+- Have two double members in your class/entity to implement the Coordinates 
+interface on class level, use the @Spatial annotation at class level and the 
+name parameter to label the fields of the index
+
+@Entity
+@Indexed
+@Spatial(name = "location")
+public class Hotel implements Coordinates {
+	@Id
+	Integer id;
+
+	@Field(store = Store.YES)
+	String name;
+
+	@Field(store = Store.YES, index = Index.YES)
+	String type;
+
+	double latitude;
+	double longitude;
+}
+
+or
+
+- Have a getter like method implementing the Coordinates interface and use 
+the @Spatial annotation at method level on it
+
+@Entity
+@Indexed
+public class Event {
+	@Id
+	Integer id;
+
+	@Field(store = Store.YES)
+	String name;
+
+	@Field(store = Store.YES, index = Index.YES)
+	Date date;
+
+	@Field(store = Store.YES, index = Index.YES)
+	@NumericField
+	double latitude;
+	@Field(store = Store.YES, index = Index.YES)
+	@NumericField
+	double longitude;
+
+	@Field(analyze = Analyze.NO)
+	@Spatial
+	public Coordinates getLocation() {
+		return new Coordinates() {
+			@Override
+			public double getLatitude() {
+				return latitude;
+			}
+
+			@Override
+			public double getLongitude() {
+				return longitude;
+			}
+		};
+	}
+}
+
+
+To spatially search you shall build a Query by using SpatialQueryBuilder by using the buildSpatialQuery method. 
+The parameters are the latitude and longitude of the center point plus the radius of the search discus and the name 
+of the spatial index fields (either precised via the name parameter in the class level annotation or derived from 
+the name of the getter like method if using the method level annotation : getLocation => location)
+
+org.apache.lucene.search.Query luceneQuery2 = SpatialQueryBuilder.buildSpatialQuery(
+    centerLatitude,
+    centerLongitude,
+    51,
+    "location"
+);
+org.hibernate.Query hibQuery2 = fullTextSession.createFullTextQuery( luceneQuery2, Hotel.class );
+List results2 = hibQuery2.list();
+
+
+You can combine this query with other filter/queries to further restrict the search as you will do with any Query.
+
+
+How does it work
+
+At indexation level :
+When Hibernate search index the entity ann otated with @Spatial, it instantiate a SpatialFieldBridge 
+to transform the latitude and longitude fields accessed via the Coordiantes interface to the multiple 
+index fields stored in the Lucene index.
+
+Principle of the spatial index : the spatial index used in Hibernate Search is a Quad-Tree 
+(http://en.wikipedia.org/wiki/Quadtree) type.
+
+To make computation in a flat coordinates system the latitude and longitude field values will be projected 
+with a sinusoidal projection (http://en.wikipedia.org/wiki/Sinusoidal_projection). Origin values space 
+is [-90 -> +90],[-180 -> 180] for latitude,longitude coordinates and projected space is 
+[-pi -> +pi],[-pi/2 -> +pi/2] for cartesian x,y coordinates (beware of fields order inversion : x is longitude and y is latitude).
+
+The index is divided into n levels labeled from 0 to n-1.
+
+At the 0 level the projected space is the whole earth.
+At the 1 level the projected space is devided into 4 rectangles ( called boxes as in bouding box): 
+[-pi,-pi/2]->[0,0], [-pi,0]->[0,+pi/2], [0,-pi/2]->[+pi,0] and [0,0]->[+pi,+pi/2].
+At level n+1 each box of the n levvel is devided into 4 new boxes and so on. The numbers of rectangles 
+(boxes) at a given level is 4^n
+
+Each box is given an id. Ths Ids are in this format : [Box index on the X axis]|[Box index on the Y axis]
+To calculate the index of a box on an axis we divide the axis range in 2^n slots and find the slot the box belongs to.
+At the n level the indexes on an axis are from -(2^n)/2 to (2^n)/2.
+For instance, the 5th level has 4^5 = 1024 boxes with 32 indexes on each axis (32x32 is 1024) 
+and the box of Id "0|8" is covering the [0,8/32*pi/2]->[1/32*pi,9/32*pi/2] rectangle is projected space.
+Beware ! The boxes are rectangles in projected space but the related area on earth is not !
+
+Now that we have all these boxes at all these levels will be indexing points "into" them.
+
+For a point (lat,long) we calculate its projection (x,y) and then we calculate for each level of the 
+spatial index, the ids of the boxes it belongs to. 
+At each level the point is in one and only one box. For points on the edges the box are considered 
+exclusive on the left side and inclusive on the right i-e ]start,end] (the points are normalized 
+before projection to ]-90,+90],]-180,+180]).
+We store in the lucene document corresponding to the entity to index one field for each level of the grid. 
+The field is named : [spatial index fields name]_HSSI_[n] where [spatial index fields name] is the name given 
+either by the parameter at class level annotation or derived from the name of the spatial annoted method of the 
+entitiy, HSSI stands for Hibernate Search Spatial Index and n is the level of the grid.
+
+We also store the latitude and longitude in numeric field under [spatial index fields name]_HSSI_Latitude and 
+[spatial index fields name]_HSSI_Longitude fields.
+
+At search level :
+Now that we have all these fields, what are they here for ?
+
+When you ask for a spatial search by providing a search discus (center+radius) we will calculate the 
+boxes ids that do cover the search discus in the projected space, fetch all the documents that belong to 
+there boxes (thus narrowing the number of documents for which we will have to calculate distance to the center) 
+and then filter this subset with a real distance calculation. This is called two level spatial filtering.
+
+- Step 1 : compute the best grid level for the search discus
+
+For a given search radius there is an optimal grid level where the number of boxes to retrieve shall be minimal 
+without bringing back to many documents (level 0 has only 1 box but retrieve all documents). The optimal grid 
+level is maximum level where the boxes width (on the X axis) is larger than the search area. Near the equator 
+line where projection deformation is minimal, this will lead to the retrieval of at most 4 boxes. Towards the 
+poles with deformation, it may bring more boxes but as the sinusoidal projection has a Tissot's indicatrix quite 
+simple (see http://en.wikipedia.org/wiki/Sinusoidal_projection) in populated area, the overhead is minimal. (This should be tested, sampled and benchmarked).
+
+This computation is done by org.hibernate.search.spatial.impl.GridHelper.findBestGridLevelForSearchRange(double searchRange)
+
+- Step 2 : compute the corresponding covering boCellIds at that level
+
+Now we have the optimal level chosen, we can compute the ids of the boxes covering the search discus (which is 
+not a discus in projected space anymore). 
+
+This is done by org.hibernate.search.spatial.impl.GridHelper.getGridCellsIds(Point center, double radius, int gridLevel)
+
+It will calculate the bouding box of the search discus and then call 
+org.hibernate.search.spatial.impl.GridHelper.getGridCellsIds(Point lowerLeft, Point upperRight, int gridLevel) that will 
+do the actual computation. If the bouding box crosses the merdian line it will cut the search in two and make two calls 
+to getGridCellsIds(Point lowerLeft, Point upperRight, int gridLevel) with left and right parts of the bouding box.
+There are some geo related hacks (search radius too large, search radius crossing the poles) that are handled in bounding 
+box computations done by Rectangle.fromBoundingCircle(Point center, double radius) 
+(see http://janmatuschek.de/LatitudeLongitudeBoundingCoordinates for reference on those subjects).
+
+The GridHelper.getGridCellsIds(Point lowerLeft, Point upperRight, int gridLevel) project the defining points of 
+the bouding box and compute the boxes they belong to. It returns all the box Ids between the lower left to the upper right 
+corners, thus covering the area.
+
+- Step 3 : Lucene index lookup
+
+The Query is build with theses Ids to lookup for documents having a [spatial index fields name]_HSSI_[n] 
+(n the level found at Step 1) field valued with one of the ids of Step 2. 
+
+See org.hibernate.search.spatial.impl.GridFilter implentation.
+
+This Query will return all documents in the boxes covering the projected bouding box of the search discus. 
+So it is too large and need refining. But we have narrowed the distance calculation problems to a subet of our datas.
+
+- Step 4 : refine 
+
+A distance calulation filter is set after the Lucene index lookup query of Step 3 to exclude false candidate 
+from the result list.
+
+See SpatialQueryBuilderFromPoint.buildSpatialQuery(Point center, double radius, String fieldName)
+
+
+
+
+
